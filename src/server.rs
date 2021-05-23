@@ -1,11 +1,20 @@
 use crate::matchers::{matcher_name, ExecutionContext, Matcher};
 use crate::responders::Responder;
+use futures::future::FutureExt;
+use hyper::server::accept::Accept;
+use hyper::server::conn::AddrIncoming;
+use hyper::{
+    service::{make_service_fn, service_fn},
+    Error,
+};
+use std::error::Error as StdError;
 use std::fmt;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::ops::{Bound, RangeBounds};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncRead, AsyncWrite};
 
 // type alias for a request that has read a complete body into memory.
 type FullRequest = http::Request<hyper::body::Bytes>;
@@ -17,20 +26,33 @@ pub struct Server {
     join_handle: Option<std::thread::JoinHandle<()>>,
     addr: SocketAddr,
     state: ServerState,
+    scheme: http::uri::Scheme,
 }
 
 impl Server {
-    /// Start a server.
+    /// Start a IPv4 server.
     ///
     /// The server will run in the background. On Drop it will terminate and
     /// assert it's expectations.
     pub fn run() -> Self {
-        use futures::future::FutureExt;
-        use hyper::{
-            service::{make_service_fn, service_fn},
-            Error,
-        };
         let bind_addr = ([127, 0, 0, 1], 0).into();
+        Self::from_addr(bind_addr)
+    }
+
+    /// Start a IPv6 server.
+    ///
+    /// The server will run in the background. On Drop it will terminate and
+    /// assert it's expectations.
+    pub fn run_ipv6() -> Self {
+        let bind_addr = ([0, 0, 0, 0, 0, 0, 0, 1], 0).into();
+        Self::from_addr(bind_addr)
+    }
+
+    /// Start a server bound to an address specified by `bind_addr`.
+    ///
+    /// The server will run in the background. On Drop it will terminate and
+    /// assert it's expectations.
+    pub fn from_addr(bind_addr: SocketAddr) -> Self {
         // And a MakeService to handle each connection...
         let state = ServerState::default();
         let make_service = make_service_fn({
@@ -67,8 +89,12 @@ impl Server {
                 .build()
                 .unwrap();
             runtime.block_on(async move {
-                let server = hyper::Server::bind(&bind_addr).serve(make_service);
-                addr_tx.send(server.local_addr()).unwrap();
+                let incoming = AddrIncoming::bind(&bind_addr).unwrap();
+                let local_addr = incoming.local_addr();
+
+                let server = hyper::Server::builder(incoming).serve(make_service);
+                addr_tx.send(local_addr).unwrap();
+
                 futures::select! {
                     _ = server.fuse() => {},
                     _ = shutdown_received.fuse() => {},
@@ -81,6 +107,76 @@ impl Server {
             join_handle: Some(join_handle),
             addr,
             state,
+            scheme: http::uri::Scheme::HTTP,
+        }
+    }
+
+    /// Start a server from an acceptor.
+    ///
+    /// `local_addr` is an address for an already bound socket (cannot have a port 0).
+    /// `scheme` is a protocol used acceptor's underlying server.
+    ///
+    /// The server will run in the background. On Drop it will terminate and
+    /// assert it's expectations.
+    pub fn from_acceptor<I>(incoming: I, local_addr: SocketAddr, scheme: http::uri::Scheme) -> Self
+    where
+        I: Accept + Send + 'static,
+        I::Error: Into<Box<dyn StdError + Send + Sync>>,
+        I::Conn: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        // Acceptor doesn't expose local_addr so we have to make sure
+        // that user passed in a local_addr that's isn't with port 0
+        assert!(local_addr.port() != 0);
+
+        // And a MakeService to handle each connection...
+        let state = ServerState::default();
+        let make_service = make_service_fn({
+            let state = state.clone();
+            move |_| {
+                let state = state.clone();
+                async move {
+                    let state = state.clone();
+                    Ok::<_, Error>(service_fn({
+                        move |req: http::Request<hyper::Body>| {
+                            let state = state.clone();
+                            async move {
+                                // read the full body into memory prior to handing it to matchers.
+                                let (head, body) = req.into_parts();
+                                let full_body = hyper::body::to_bytes(body).await?;
+                                let req = http::Request::from_parts(head, full_body);
+                                log::debug!("Received Request: {:?}", req);
+                                let resp = on_req(state, req).await;
+                                log::debug!("Sending Response: {:?}", resp);
+                                hyper::Result::Ok(resp)
+                            }
+                        }
+                    }))
+                }
+            }
+        });
+        // Then bind and serve...
+        let (trigger_shutdown, shutdown_received) = futures::channel::oneshot::channel();
+        let join_handle = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async move {
+                let server = hyper::Server::builder(incoming).serve(make_service);
+
+                futures::select! {
+                    _ = server.fuse() => {},
+                    _ = shutdown_received.fuse() => {},
+                }
+            });
+        });
+        Server {
+            trigger_shutdown: Some(trigger_shutdown),
+            join_handle: Some(join_handle),
+            addr: local_addr,
+            state,
+            scheme,
         }
     }
 
@@ -96,7 +192,7 @@ impl Server {
     /// `server.url("/foo?q=1") == "http://localhost:1234/foo?q=1"`
     pub fn url(&self, path_and_query: &str) -> http::Uri {
         hyper::Uri::builder()
-            .scheme("http")
+            .scheme(self.scheme.clone())
             .authority(self.addr.to_string().as_str())
             .path_and_query(path_and_query)
             .build()
